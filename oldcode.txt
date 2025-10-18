@@ -1,0 +1,406 @@
+//
+//  oldcode.cpp
+//  helloworldsdl
+//
+//  Created by Liana Xie on 7/15/24.
+//
+
+
+
+void XQGame::taskAccept(){
+    //blocks
+    int acceptedSockfd = accept(mySocketfd, nullptr, nullptr);
+    
+    //check if accept succeeded
+    if(acceptedSockfd >= 0){
+        //succeeded
+        //get old socket
+        int oldSocketfd = mySocketfd;
+        //set socket to newly accepted socket = connected!
+        mySocketfd = acceptedSockfd;
+        connected = true;
+        //close old socket (done afterwards for thread-safety)
+        close(oldSocketfd);
+        
+        
+    }else{
+        //idk this shouldnt happen
+        mySocketfd = -1;
+    }
+}
+
+void XQGame::taskRecieve(){
+    const std::lock_guard<std::mutex> lock(recieveMutex);
+    //wait for their turn/check for messages
+    //0 = no flags
+    size_t msgLen = recv(mySocketfd, &lastRecievedMessage, sizeof(XQGameMessage), 0);
+    
+    if(msgLen == 0){
+        //other party disconnected
+        lastRecievedMessage = {XQGameMessage::Flag::QUIT, 0, 0, 0, 0};
+    }
+    lastRcvdMsgProcessed = false;
+}
+
+
+void XQGame::run(SDL_Event& event){
+    
+    while (true) {
+        bool renderAgain = false;
+        bool processFurtherEvents = true;
+        
+        //for unconnected servers, draw an overlay
+        if(!connected){
+            drawBoard();
+            //draw overlay to signify still waiting
+            drawOverlay(u"<...>", COLOR_WHITE);
+            //don't do anything else
+            processFurtherEvents = false;
+        }
+        //connected server or client
+        //and needs to process a message
+        else if(gameType != OFFLINE && !lastRcvdMsgProcessed){
+            const std::lock_guard<std::mutex> lock(recieveMutex);
+            
+            switch (lastRecievedMessage.flag) {
+                case XQGameMessage::Flag::MOVE:
+                    if(!myTurn()){
+                        //other side's move
+                        movePiece({lastRecievedMessage.x_from, lastRecievedMessage.y_from}
+                                  , {lastRecievedMessage.x_to,
+                            lastRecievedMessage.y_to});
+                        renderAgain = true;
+                    }
+                    break;
+                case XQGameMessage::Flag::QUIT:
+                    endGame(false);
+                    renderAgain = true;
+                case XQGameMessage::Flag::RESTART:
+                    endGame(true);
+                    renderAgain = true;
+                default:
+                    break;
+            }
+            lastRcvdMsgProcessed = true;
+            
+            socketTask = std::async(std::launch::async, &XQGame::taskRecieve, this);
+        }
+        
+        while (SDL_PollEvent(&event)) {
+            if (event.type == SDL_QUIT) {
+                return;
+            }
+            if(processFurtherEvents){
+                if(event.type == SDL_MOUSEMOTION){
+                    mouseMovedHighlight({event.motion.x, event.motion.y});
+                    renderAgain = true;
+                }
+                else if(event.type == SDL_MOUSEBUTTONDOWN){
+                    if(hasSelection()){
+                        mouseDownMove({event.button.x, event.button.y});
+                    }else{
+                        mouseDownSelect({event.button.x, event.button.y});
+                    }
+                    renderAgain = true;
+                }
+            }
+        }
+        if(renderAgain){
+            SDL_RenderClear(renderer_);
+            
+            drawBoard();
+            if(gameOver){
+                if(!gameWon){
+                    drawOverlay(u"END", COLOR_WHITE);
+                }else{
+                    SDL_Color color = *gameWon==XQPiece::Side::RED ? COLOR_RED : COLOR_WHITE;
+                    drawOverlay(u"WON", color);
+                }
+            }
+            
+            SDL_RenderPresent(renderer_);
+        }
+        
+        std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    }
+}
+
+
+
+
+bool XQGame::validMove(BoardPoint from, BoardPoint to){
+    XQPiece& piece = *pieceAt(from);
+    
+    //cannot move to a spot an ally piece currently occupies
+    if(!noPieceAt(to) && pieceAt(to)->side()==piece.side()){
+        return false;
+    }
+    
+    //whether or not to enforce 王不见王
+    if constexpr(WANGBUJIANWANG){
+        //perform move with transient boardState
+        XQPiece* tempBoardState[XQBOARD_SPOTS_HEIGHT][XQBOARD_SPOTS_WIDTH];
+        for(int i=0; i<XQBOARD_SPOTS_HEIGHT; ++i){
+            for(int j=0; j<XQBOARD_SPOTS_WIDTH; ++j){
+                tempBoardState[i][j] = boardState[i][j];
+            }
+        }
+        tempBoardState[to.y][to.x] = tempBoardState[from.y][from.x];
+        tempBoardState[from.y][from.x] = nullptr;
+        //check if the two generals are on the same file with nothing in between
+        BoardPoint redGeneral = generalLocation(XQPiece::Side::RED, tempBoardState);
+        BoardPoint blackGeneral = generalLocation(XQPiece::Side::BLACK, tempBoardState);
+        //only need to check if they're facing if they are on the same file
+        bool nothingBetween = true;
+        if(redGeneral.x == blackGeneral.x){
+            for(int i=blackGeneral.y+1; i<redGeneral.y; ++i){
+                if(tempBoardState[i][blackGeneral.x]!=nullptr){
+                    nothingBetween = false;
+                    break;
+                }
+            }
+            if(nothingBetween){
+                return false;
+            }
+        }
+    }
+    
+    switch (piece.type()) {
+        //chariot
+        case XQPiece::Type::R: {
+            if(from.y == to.y){
+                for(int i=std::min(from.x, to.x)+1; i<std::max(from.x, to.x); ++i){
+                    if(!noPieceAt({i, from.y})){ return false; }
+                }
+                return true;
+            }
+            else if(from.x == to.x){
+                for(int i=std::min(from.y, to.y)+1; i<std::max(from.y, to.y); ++i){
+                    if(!noPieceAt({from.x, i})){ return false; }
+                }
+                return true;
+            }
+            return false;
+        }
+        //horse
+        case XQPiece::Type::H: {
+            int yDiff = to.y-from.y;
+            int xDiff = to.x-from.x;
+            return ((std::abs(xDiff)==1 && yDiff== 2 && noPieceAt({from.x, from.y+1})) ||
+                    (std::abs(xDiff)==1 && yDiff==-2 && noPieceAt({from.x, from.y-1})) ||
+                    (std::abs(yDiff)==1 && xDiff== 2 && noPieceAt({from.x+1, from.y})) ||
+                    (std::abs(yDiff)==1 && xDiff==-2 && noPieceAt({from.x-1, from.y})));
+        }
+        //cannon
+        case XQPiece::Type::C: {
+            //number of pieces between `from` and `to`, not including whatever is on `to`.
+            int betweenCount = 0;
+            if(from.y == to.y){
+                for(int i=std::min(from.x, to.x)+1; i<std::max(from.x, to.x); ++i){
+                    if(!noPieceAt({i, from.y})){ ++betweenCount; }
+                }
+            }
+            else if(from.x == to.x){
+                for(int i=std::min(from.y, to.y)+1; i<std::max(from.y, to.y); ++i){
+                    if(!noPieceAt({from.x, i})){ ++betweenCount; }
+                }
+            }
+            else{
+                return false;
+            }
+            //non-capture move
+            if(betweenCount==0){ return true; }
+            //capture; must jump over another piece
+            else if(betweenCount==1 && !noPieceAt(to)){ return true; }
+            return false;
+        }
+        //pawn
+        case XQPiece::Type::P: {
+            bool sideBlack = pieceAt(from)->side() == XQPiece::Side::BLACK;
+            bool crossedRiver = (sideBlack && from.y < XQBOARD_SPOTS_HEIGHT/2) ||
+                                (!sideBlack && from.y >= XQBOARD_SPOTS_HEIGHT/2);
+            int forwardOne = sideBlack ? from.y+1 : from.y-1;
+            
+            if(crossedRiver){
+                //hasnt crossed the river
+                return (to.x==from.x && to.y==(forwardOne));            //one spot forward
+            }else{
+                //has crossed the river
+                return (to.y==from.y && std::abs(from.x-to.x)==1) ||    //one spot to the side
+                        (to.x==from.x && to.y==(forwardOne));           //one spot forward
+            }
+        }
+        //elephant
+        case XQPiece::Type::E: {
+            bool sideBlack = pieceAt(from)->side() == XQPiece::Side::BLACK;
+            bool crossingRiver = (sideBlack && to.y >= XQBOARD_SPOTS_HEIGHT/2) ||
+                                (!sideBlack && to.y < XQBOARD_SPOTS_HEIGHT/2);
+            return ( !crossingRiver &&
+                    std::abs(to.x-from.x)==2 && std::abs(to.y-from.y)==2 &&    //田 movement
+                    noPieceAt({(to.x+from.x)/2, (to.y+from.y)/2}));             //no piece in center of 田
+        }
+        //advisor
+        case XQPiece::Type::A: {
+            return (inRightPalace(to, piece.side()) &&
+                    ((from.x==to.x && std::abs(from.y-to.y)==1) || (from.y==to.y && std::abs(from.x-to.x)==1) ||
+                    (to.x==4 && (to.y==1 || to.y==XQBOARD_SPOTS_HEIGHT-2)) ||
+                    (from.x==4 && (from.y==1 || from.y==XQBOARD_SPOTS_HEIGHT-2))
+                     ));   //center spot of palace
+        }
+        //general
+        case XQPiece::Type::K: {
+            return (inRightPalace(to, piece.side()) &&
+                    ((from.x==to.x && std::abs(from.y-to.y)==1) || (from.y==to.y && std::abs(from.x-to.x)==1) ||
+                    (to.x==4 && (to.y==1 || to.y==XQBOARD_SPOTS_HEIGHT-2)) ||
+                    (from.x==4 && (from.y==1 || from.y==XQBOARD_SPOTS_HEIGHT-2))
+                    ));   //center spot of palace
+        }
+        default:
+            return false;
+    }
+}
+
+
+int betweenCount = 0;
+if(piece.type()==XQPiece::Type::K && to.x!=from.x   //piece moving is a general
+   ){
+    BoardPoint opposingGeneral = {-1,-1};
+    if((piece.side()==XQPiece::Side::BLACK && redGeneral && to.x==redGeneral->x)){
+        opposingGeneral = redGeneral.value();
+    }else if(piece.side()==XQPiece::Side::RED && blackGeneral && to.x==blackGeneral->x){
+        opposingGeneral = blackGeneral.value();
+    }
+    if(opposingGeneral.x < 0){
+        for(int i=std::min(to.y+1, opposingGeneral.y+1); i<std::max(to.y+1, opposingGeneral.y+1); ++i){
+            if(!noPieceAt({to.x, i})){
+                return false;
+            }
+        }
+    }
+}
+else if(blackGeneral->x == redGeneral->x == from.x && from.x != to.x){
+    for(int i=blackGeneral->y+1; i<redGeneral->y; ++i){
+        if(!noPieceAt({blackGeneral->x, i})){ ++betweenCount; }
+    }
+    if(betweenCount==1){
+        return false;
+    }
+}
+
+
+SDL_Point XQGame::pieceSpot(int x, int y){
+    int temp = boardWidth-(10*(boardWidth/11));
+    return { (winWidth-boardWidth)/2 + temp+temp/2 + x*(boardWidth/11),
+             (winHeight-boardWidth)/2 + (y+1)*(boardWidth/11) };
+}
+
+
+/*
+TTF_Font* pieceFont = TTF_OpenFont(UNIFONTEX_PATH, 50);
+
+XQPiece testPiece(XQPiece::Type::E, XQPiece::Side::RED, pieceFont, game.renderer());
+SDL_Point spot{100, 100};
+drawTextOnRect(game.renderer(), testPiece.texture(), testPiece.setRectCoords(spot));
+
+XQPiece testPiece2(XQPiece::Type::A, XQPiece::Side::RED, pieceFont, game.renderer());
+SDL_Point spot2{200, 100};
+drawTextOnRect(game.renderer(), testPiece2.texture(), testPiece2.setRectCoords(spot2));
+*/
+/*
+TTF_Font* pieceFont = TTF_OpenFont(UNIFONTEX_PATH, 50);
+SDL_Surface* sur = TTF_RenderUNICODE_Solid(pieceFont, reinterpret_cast<const Uint16*>(u"兵"), COLOR_RED);
+SDL_Texture* tex = SDL_CreateTextureFromSurface(game.renderer(), sur);
+SDL_Rect textRect{200, 200, 100, 100};
+SDL_RenderCopy(game.renderer(), tex, nullptr, &textRect);
+SDL_FreeSurface(sur);
+SDL_DestroyTexture(tex);
+ */
+
+
+/*
+ {
+ XQPiece(XQPiece::Type::K, XQPiece::Side::RED),
+ XQPiece(XQPiece::Type::R, XQPiece::Side::RED),
+ XQPiece(XQPiece::Type::R, XQPiece::Side::RED),
+ XQPiece(XQPiece::Type::H, XQPiece::Side::RED),
+ XQPiece(XQPiece::Type::H, XQPiece::Side::RED),
+ XQPiece(XQPiece::Type::C, XQPiece::Side::RED),
+ XQPiece(XQPiece::Type::C, XQPiece::Side::RED),
+ XQPiece(XQPiece::Type::A, XQPiece::Side::RED),
+ XQPiece(XQPiece::Type::A, XQPiece::Side::RED),
+ XQPiece(XQPiece::Type::E, XQPiece::Side::RED),
+ XQPiece(XQPiece::Type::E, XQPiece::Side::RED),
+ XQPiece(XQPiece::Type::P, XQPiece::Side::RED),
+ XQPiece(XQPiece::Type::P, XQPiece::Side::RED),
+ XQPiece(XQPiece::Type::P, XQPiece::Side::RED),
+ XQPiece(XQPiece::Type::P, XQPiece::Side::RED),
+ XQPiece(XQPiece::Type::P, XQPiece::Side::RED),
+ 
+ XQPiece(XQPiece::Type::K, XQPiece::Side::BLACK),
+ XQPiece(XQPiece::Type::R, XQPiece::Side::BLACK),
+ XQPiece(XQPiece::Type::R, XQPiece::Side::BLACK),
+ XQPiece(XQPiece::Type::H, XQPiece::Side::BLACK),
+ XQPiece(XQPiece::Type::H, XQPiece::Side::BLACK),
+ XQPiece(XQPiece::Type::C, XQPiece::Side::BLACK),
+ XQPiece(XQPiece::Type::C, XQPiece::Side::BLACK),
+ XQPiece(XQPiece::Type::A, XQPiece::Side::BLACK),
+ XQPiece(XQPiece::Type::A, XQPiece::Side::BLACK),
+ XQPiece(XQPiece::Type::E, XQPiece::Side::BLACK),
+ XQPiece(XQPiece::Type::E, XQPiece::Side::BLACK),
+ XQPiece(XQPiece::Type::P, XQPiece::Side::BLACK),
+ XQPiece(XQPiece::Type::P, XQPiece::Side::BLACK),
+ XQPiece(XQPiece::Type::P, XQPiece::Side::BLACK),
+ XQPiece(XQPiece::Type::P, XQPiece::Side::BLACK),
+ XQPiece(XQPiece::Type::P, XQPiece::Side::BLACK)
+}
+ */
+
+/*
+int rowHeight = boardWidth/11;
+int rowWidth = rowHeight;
+int sideBorderWidth = boardWidth-(10*rowWidth);
+sideBorderWidth = sideBorderWidth + sideBorderWidth/2;
+//corners of board
+SDL_Point boardUpperLeft = {borderUpperLeft.x+sideBorderWidth, borderUpperLeft.y+rowHeight};
+SDL_Point boardLowerRight = {borderLowerRight.x-sideBorderWidth, borderLowerRight.y-rowHeight};
+SDL_Point boardUpperRight = {boardLowerRight.x, boardUpperLeft.y};
+SDL_Point boardLowerLeft = {boardUpperLeft.x, boardLowerRight.y};
+    
+//draw horizontal lines of board
+setRendererColor(renderer_, COLOR_BLACK);
+for(int lineY=boardUpperLeft.y; lineY<=boardLowerRight.y; lineY+=rowHeight){
+    SDL_RenderDrawLine(renderer_, boardUpperLeft.x, lineY, boardLowerRight.x, lineY);
+}
+
+//draw vertical lines of board
+//first draw left and right edges
+drawLineWithPoints(renderer_, boardUpperLeft, boardLowerLeft);
+drawLineWithPoints(renderer_, boardUpperRight, boardLowerRight);
+
+//draw the vertical lines above the river
+SDL_Point tempUpperPt = {boardUpperLeft.x+rowWidth, boardUpperLeft.y};
+SDL_Point tempLowerPt = {boardUpperLeft.x+rowWidth, boardUpperLeft.y+(rowHeight*4)};
+for(int i=0; i<7; ++i){
+    drawLineWithPoints(renderer_, tempUpperPt, tempLowerPt);
+    tempUpperPt.x += rowWidth;
+    tempLowerPt.x += rowWidth;
+}
+//draw the vertical lines below the river
+tempUpperPt = {boardUpperLeft.x+rowWidth, boardUpperLeft.y+(rowHeight*5)};
+tempLowerPt = {boardUpperLeft.x+rowWidth, boardLowerLeft.y};
+for(int i=0; i<7; ++i){
+    drawLineWithPoints(renderer_, tempUpperPt, tempLowerPt);
+    tempUpperPt.x += rowWidth;
+    tempLowerPt.x += rowWidth;
+}
+
+//draw diagonal lines
+int leftDiagonalX = boardUpperLeft.x+(rowWidth*3);
+int rightDiagonalX = boardUpperLeft.x+(rowWidth*5);
+int topDiagonalY = boardUpperLeft.y+(rowHeight*2);
+int bottomDiagonalY = boardUpperLeft.y+(rowHeight*7);
+SDL_RenderDrawLine(renderer_, leftDiagonalX, boardUpperLeft.y, rightDiagonalX, topDiagonalY);
+SDL_RenderDrawLine(renderer_, rightDiagonalX, boardUpperLeft.y, leftDiagonalX, topDiagonalY);
+SDL_RenderDrawLine(renderer_, leftDiagonalX, bottomDiagonalY, rightDiagonalX, boardLowerLeft.y);
+SDL_RenderDrawLine(renderer_, rightDiagonalX, bottomDiagonalY, leftDiagonalX, boardLowerLeft.y);
+ */
